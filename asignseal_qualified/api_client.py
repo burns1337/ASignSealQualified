@@ -1,61 +1,46 @@
-from __future__ import annotations
-
-import json
-from dataclasses import dataclass
-from typing import Optional, List
-from urllib.parse import quote
-
+# asign_seal_qualified/api_client.py
 import requests
-
-from .crypto import b64, sha256, sign_with_auth_key, get_cert_serial_decimal, load_auth_p12
-from .models import SignatureResponse, BatchHashData, BatchSignatureData, ApiError, AuthCredentials
-
-
-@dataclass
-class SealSignatureService:
-    base_url: str
-
-    def _url(self, path: str) -> str:
-        return f"{self.base_url.rstrip('/')}{path}"
-
-    def get_seal_certificate(self, auth_serial: str, sid: Optional[str] = None) -> bytes:
-        sid = sid or "dummy"
-        url = self._url(f"/Certificate/{quote(auth_serial)}/{quote(sid)}")
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            raise ApiError(r.status_code, r.text)
-        return r.content
-
-    def sign_hash(self, auth_serial: str, hash_bytes: bytes, auth_signature_bytes: bytes, sid: Optional[str] = None) -> bytes:
-        sid = sid or "dummy"
-        url = self._url(f"/Sign/{quote(sid)}")
-        payload = {
-            "AuthSerial": auth_serial,
-            "Hash": b64(hash_bytes),
-            "HashSignature": b64(auth_signature_bytes),
-            "HashSignatureMechanism": "SHA256withRSA",
-        }
-        r = requests.post(url, data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=20)
-        if r.status_code != 200:
-            raise ApiError(r.status_code, r.text)
-        obj = r.json()
-        sig_b64 = obj.get("Signature")
-        if not sig_b64:
-            raise ApiError(r.status_code, "Missing Signature in response")
-        import base64
-        return base64.b64decode(sig_b64)
+import hashlib
+import base64
+from typing import Dict, Any
 
 
 class ApiClient:
-    def __init__(self, service: SealSignatureService, creds: AuthCredentials):
-        self.service = service
-        self._km = load_auth_p12(creds.p12_path, creds.password)
-        self.auth_serial = get_cert_serial_decimal(self._km.certificate)
+    def __init__(self, base_url: str, auth_credentials):
+        self.base_url = base_url.rstrip('/')
+        self.auth_creds = auth_credentials
+        self.session = requests.Session()
 
-    def fetch_seal_certificate(self, sid: Optional[str] = None) -> bytes:
-        return self.service.get_seal_certificate(self.auth_serial, sid)
+    def _authenticate_request(self, method: str, path: str, body: bytes = b'') -> Dict[str, str]:
+        """Erstellt Authentifizierungs-Header für die Anfrage"""
+        # Hash der Anfrage erstellen
+        request_data = f"{method.upper()}{path}".encode() + body
+        request_hash = hashlib.sha256(request_data).digest()
 
-    def sign_arbitrary_hash(self, hash_bytes: bytes, sid: Optional[str] = None) -> bytes:
-        # Client must authenticate by signing the hash with the auth private key
-        auth_sig = sign_with_auth_key(self._km.private_key, hash_bytes)
-        return self.service.sign_hash(self.auth_serial, hash_bytes, auth_sig, sid)
+        # Hash signieren
+        signature = self.auth_creds.sign_hash(request_hash)
+
+        return {
+            'X-ATrust-AuthCert': self.auth_creds.get_certificate_der(),
+            'X-ATrust-Signature': signature,
+            'Content-Type': 'application/json'
+        }
+
+    def post(self, endpoint: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST-Anfrage mit Authentifizierung"""
+        url = f"{self.base_url}{endpoint}"
+        body = requests.models.RequestEncodingMixin._encode_params(json_data)
+        headers = self._authenticate_request('POST', endpoint, body)
+
+        response = self.session.post(url, json=json_data, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    def get(self, endpoint: str) -> Dict[str, Any]:
+        """GET-Anfrage mit Authentifizierung"""
+        url = f"{self.base_url}{endpoint}"
+        headers = self._authenticate_request('GET', endpoint)
+
+        response = self.session.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
